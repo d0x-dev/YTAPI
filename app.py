@@ -4,6 +4,7 @@ import os
 import tempfile
 import shutil
 import logging
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -11,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Supported video qualities
+# Supported video qualities (for YouTube)
 SUPPORTED_QUALITIES = ['144', '240', '360', '480', '540', '720', '1080', '1440', '2160', 'best', 'worst']
 
 # Common cookies file names to check
@@ -22,6 +23,15 @@ COOKIES_FILES = [
     'cookies.json',
     'auth_cookies.txt'
 ]
+
+def detect_platform(url):
+    """Detect if URL is YouTube or Instagram"""
+    if 'youtube.com' in url or 'youtu.be' in url:
+        return 'youtube'
+    elif 'instagram.com' in url:
+        return 'instagram'
+    else:
+        return 'unknown'
 
 def find_cookies_file(cookies_file=None):
     """
@@ -39,13 +49,11 @@ def find_cookies_file(cookies_file=None):
     
     return None
 
-def download_video_direct(video_url, quality, cookies_file=None):
+def download_video_direct(video_url, quality=None, cookies_file=None):
     """
     Download video directly with specified quality and cookies
     """
-    # Validate quality
-    if quality not in SUPPORTED_QUALITIES:
-        raise ValueError(f"Unsupported quality. Use: {', '.join(SUPPORTED_QUALITIES)}")
+    platform = detect_platform(video_url)
     
     # Auto-find cookies file
     actual_cookies_file = find_cookies_file(cookies_file)
@@ -66,22 +74,38 @@ def download_video_direct(video_url, quality, cookies_file=None):
     else:
         logger.info("No cookies file found, proceeding without cookies")
     
-    # Set format based on quality (video only, no MP3)
-    if quality == 'best':
-        ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-    elif quality == 'worst':
-        ydl_opts['format'] = 'worstvideo[ext=mp4]+worstaudio[ext=m4a]/worst[ext=mp4]/worst'
+    # Set format based on platform
+    if platform == 'youtube':
+        if not quality:
+            quality = 'best'
+            
+        if quality not in SUPPORTED_QUALITIES:
+            raise ValueError(f"Unsupported quality. Use: {', '.join(SUPPORTED_QUALITIES)}")
+        
+        # YouTube format selection
+        if quality == 'best':
+            ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+        elif quality == 'worst':
+            ydl_opts['format'] = 'worstvideo[ext=mp4]+worstaudio[ext=m4a]/worst[ext=mp4]/worst'
+        else:
+            # Specific quality (144, 240, 360, 480, 540, 720, 1080, etc.)
+            ydl_opts['format'] = f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best'
+    
+    elif platform == 'instagram':
+        # Instagram - quality parameter is ignored, always get best
+        ydl_opts['format'] = 'best'
+        quality = 'best'  # For consistent response
+    
     else:
-        # Specific quality (144, 240, 360, 480, 540, 720, 1080, etc.)
-        ydl_opts['format'] = f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best'
+        raise ValueError("Unsupported platform. Only YouTube and Instagram URLs are supported.")
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=True)
             downloaded_file = ydl.prepare_filename(info)
             
-            logger.info(f"Successfully downloaded: {info.get('title', 'Unknown')} in {quality}p")
-            return downloaded_file, info.get('title', 'video')
+            logger.info(f"Successfully downloaded from {platform}: {info.get('title', 'Unknown')} in {quality}")
+            return downloaded_file, info.get('title', 'video'), platform
             
     except Exception as e:
         # Cleanup on error
@@ -92,10 +116,10 @@ def download_video_direct(video_url, quality, cookies_file=None):
 @app.route('/api/video/download', methods=['GET'])
 def direct_download():
     """
-    Direct download endpoint
+    Direct download endpoint for YouTube and Instagram
     Query parameters:
-    - url: YouTube video URL (required)
-    - quality: 144, 240, 360, 480, 540, 720, 1080, 1440, 2160, best, worst (required)
+    - url: YouTube/Instagram video URL (required)
+    - quality: For YouTube: 144, 240, 360, 480, 540, 720, 1080, 1440, 2160, best, worst (optional)
     - cookies: Path to cookies file (optional - auto-detects cookies.txt)
     """
     video_url = request.args.get('url')
@@ -105,18 +129,26 @@ def direct_download():
     if not video_url:
         return "Error: Video URL parameter is required", 400
     
-    if not quality:
-        return "Error: Quality parameter is required. Use: 144, 240, 360, 480, 540, 720, 1080, 1440, 2160, best, worst", 400
+    platform = detect_platform(video_url)
     
-    if quality not in SUPPORTED_QUALITIES:
-        return f"Error: Unsupported quality. Use: {', '.join(SUPPORTED_QUALITIES)}", 400
+    # Validate quality for YouTube
+    if platform == 'youtube' and quality and quality not in SUPPORTED_QUALITIES:
+        return f"Error: Unsupported quality for YouTube. Use: {', '.join(SUPPORTED_QUALITIES)}", 400
+    
+    # Instagram doesn't need quality parameter
+    if platform == 'instagram' and quality:
+        logger.info("Quality parameter ignored for Instagram")
     
     try:
-        downloaded_file, video_title = download_video_direct(video_url, quality, cookies_file)
+        downloaded_file, video_title, platform = download_video_direct(video_url, quality, cookies_file)
         
         # Clean filename for download
         clean_title = "".join(c for c in video_title if c.isalnum() or c in (' ', '-', '_')).rstrip()
-        filename = f"{clean_title}_{quality}p.mp4"
+        
+        if platform == 'youtube':
+            filename = f"{clean_title}_{quality}p.mp4"
+        else:
+            filename = f"{clean_title}_instagram.mp4"
         
         # Send file for download
         response = send_file(
@@ -144,13 +176,22 @@ def direct_download():
 @app.route('/api/video/formats', methods=['GET'])
 def available_formats():
     """
-    Get available formats for a video
+    Get available formats for a video (YouTube only)
     """
     video_url = request.args.get('url')
     cookies_file = request.args.get('cookies')
     
     if not video_url:
         return jsonify({'error': 'Video URL is required'}), 400
+    
+    platform = detect_platform(video_url)
+    
+    if platform != 'youtube':
+        return jsonify({
+            'platform': platform,
+            'message': 'Formats endpoint only available for YouTube videos',
+            'supported_qualities': ['best']  # Instagram always uses best quality
+        })
     
     # Auto-find cookies file
     actual_cookies_file = find_cookies_file(cookies_file)
@@ -187,12 +228,62 @@ def available_formats():
             available_qualities.sort(key=lambda x: int(x.replace('p', '')))
             
             return jsonify({
+                'platform': 'youtube',
                 'title': info.get('title'),
                 'duration': info.get('duration'),
                 'available_qualities': available_qualities,
                 'cookies_used': bool(actual_cookies_file),
                 'formats_count': len(formats)
             })
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/video/info', methods=['GET'])
+def video_info():
+    """
+    Get basic video information for both YouTube and Instagram
+    """
+    video_url = request.args.get('url')
+    cookies_file = request.args.get('cookies')
+    
+    if not video_url:
+        return jsonify({'error': 'Video URL is required'}), 400
+    
+    platform = detect_platform(video_url)
+    
+    # Auto-find cookies file
+    actual_cookies_file = find_cookies_file(cookies_file)
+    
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': False,
+    }
+    
+    if actual_cookies_file:
+        ydl_opts['cookiefile'] = actual_cookies_file
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            
+            response_data = {
+                'platform': platform,
+                'title': info.get('title'),
+                'duration': info.get('duration'),
+                'uploader': info.get('uploader'),
+                'view_count': info.get('view_count'),
+                'thumbnail': info.get('thumbnail'),
+                'cookies_used': bool(actual_cookies_file),
+                'url': video_url
+            }
+            
+            if platform == 'youtube':
+                response_data['supported_qualities'] = SUPPORTED_QUALITIES
+            else:
+                response_data['message'] = 'Instagram videos download in best available quality'
+            
+            return jsonify(response_data)
             
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -212,15 +303,28 @@ def check_cookies():
 @app.route('/')
 def home():
     return """
-    <h1>YouTube Video Download API</h1>
-    <p>Available endpoints:</p>
+    <h1>Video Download API</h1>
+    <p>Supports YouTube and Instagram videos</p>
+    
+    <h2>Available endpoints:</h2>
     <ul>
-        <li><strong>Direct Download:</strong> GET /api/video/download?url=YOUTUBE_URL&quality=720</li>
-        <li><strong>Available Formats:</strong> GET /api/video/formats?url=YOUTUBE_URL</li>
+        <li><strong>Direct Download:</strong> GET /api/video/download?url=URL&quality=720</li>
+        <li><strong>Video Info:</strong> GET /api/video/info?url=URL</li>
+        <li><strong>YouTube Formats:</strong> GET /api/video/formats?url=YOUTUBE_URL</li>
         <li><strong>Check Cookies:</strong> GET /api/check-cookies</li>
     </ul>
-    <p>Supported qualities: 144, 240, 360, 480, 540, 720, 1080, 1440, 2160, best, worst</p>
-    <p>Auto-detects cookies.txt file for age-restricted videos</p>
+    
+    <h2>Supported Platforms:</h2>
+    <ul>
+        <li><strong>YouTube:</strong> Quality options: 144, 240, 360, 480, 540, 720, 1080, 1440, 2160, best, worst</li>
+        <li><strong>Instagram:</strong> Always downloads best available quality (quality parameter ignored)</li>
+    </ul>
+    
+    <h2>Example URLs:</h2>
+    <p><strong>YouTube:</strong> http://localhost:5000/api/video/download?url=https://youtu.be/BOF2KmrhJfc&quality=720</p>
+    <p><strong>Instagram:</strong> http://localhost:5000/api/video/download?url=https://instagram.com/p/ABC123/</p>
+    
+    <p>Auto-detects cookies.txt file for age-restricted/private videos</p>
     """
 
 if __name__ == '__main__':
@@ -231,4 +335,5 @@ if __name__ == '__main__':
     else:
         print("⚠️  No cookies file found. Age-restricted videos may not work.")
     
+    print("🚀 Video Download API started - Supports YouTube & Instagram")
     app.run(debug=True, host='0.0.0.0', port=5000)
