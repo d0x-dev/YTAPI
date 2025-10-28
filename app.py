@@ -336,4 +336,4 @@ if __name__ == '__main__':
         print("⚠️  No cookies file found. Age-restricted videos may not work.")
     
     print("🚀 Video Download API started - Supports YouTube & Instagram")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=8080)
